@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+
+# heavily borrowed from:
+# https://github.com/just-containers/skaware/blob/v1.13.0/skarnet-builder/build-latest
+
+set -e
+
+BASEDIR="/skarnet"
+BUILDDIR="$BASEDIR/build"
+PACKAGEDIR="$BASEDIR/package"
+DISTDIR="$BASEDIR/dist"
+
+mkdir -p "$BUILDDIR" "$PACKAGEDIR" "$DISTDIR"
+
+# bin for compiled make (>= 4.x)
+MAKEBIN="$PACKAGEDIR/make/bin/make"
+
+skarnet_all_packages=(
+  skalibs
+  execline
+  s6
+)
+
+skarnet_install_packages=(
+  execline
+  s6
+)
+
+declare -A versions
+versions[make]=4.1
+versions[musl]=1.1.10
+versions[skalibs]=2.3.5.1
+versions[execline]=2.1.2.2
+versions[s6]=2.1.6.0
+
+declare -A includes
+includes[skalibs]="--with-include=$PACKAGEDIR/musl/include"
+includes[execline]="--with-include=$PACKAGEDIR/skalibs/usr/include ${includes[skalibs]}"
+includes[s6]="--with-include=$PACKAGEDIR/execline/usr/include ${includes[execline]}"
+
+declare -A libs
+libs[skalibs]="--with-lib=$PACKAGEDIR/musl/lib"
+libs[execline]="--with-lib=$PACKAGEDIR/skalibs/usr/lib ${libs[skalibs]}"
+libs[s6]="--with-lib=$PACKAGEDIR/execline/usr/lib ${libs[execline]}"
+
+declare -A sysdeps
+sysdeps[skalibs]=""
+sysdeps[execline]="--with-sysdeps=$PACKAGEDIR/skalibs/usr/lib/skalibs/sysdeps"
+sysdeps[s6]="${sysdeps[execline]}"
+
+declare -A configopts
+configopts[skalibs]="--datadir=/etc --enable-force-devr"
+configopts[execline]=""
+configopts[s6]=""
+
+function build_make {
+  echo "==> Building make@${versions[make]}"
+
+  cd "$BUILDDIR"
+  curl -o make.tgz -sSL "http://ftp.gnu.org/gnu/make/make-${versions[make]}.tar.gz"
+  curl -o make.tgz.asc -sSL "http://ftp.gnu.org/gnu/make/make-${versions[make]}.tar.gz.sig"
+  gpg -q --keyserver pgp.mit.edu --recv-keys 6338B6D4
+  gpg --verify make.tgz.asc
+  tar -xf make.tgz
+  rm -f make.tgz*
+
+  cd "make-${versions[make]}"
+  ./configure --prefix="$PACKAGEDIR/make"
+  make
+  make install
+}
+
+function build_musl {
+  echo "==> Building musl@${versions[musl]}"
+
+  cd "$BUILDDIR"
+  curl -o musl.tgz -sSL "http://www.musl-libc.org/releases/musl-${versions[musl]}.tar.gz"
+  curl -o musl.tgz.asc -sSL "http://www.musl-libc.org/releases/musl-${versions[musl]}.tar.gz.asc"
+  gpg -q --keyserver pgp.mit.edu --recv-keys 3020450F
+  gpg --verify musl.tgz.asc
+  tar -xf musl.tgz
+  rm -f musl.tgz*
+
+  cd "musl-${versions[musl]}"
+  CFLAGS="-fno-toplevel-reorder -fno-stack-protector" \
+    ./configure --prefix="$PACKAGEDIR/musl" --disable-shared
+  $MAKEBIN
+  $MAKEBIN install
+}
+
+function build_skarnet_package {
+  local package
+  package="$1"
+  echo "==> Build ${package}@${versions[$package]}"
+
+  cd "$BUILDDIR"
+  curl -sSL "http://skarnet.org/software/${package}/${package}-${versions[$package]}.tar.gz" | tar -xz
+
+  cd "${package}-${versions[$package]}"
+  CC="$PACKAGEDIR/musl/bin/musl-gcc" ./configure \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --enable-static \
+    --disable-shared \
+    --enable-static-libc \
+    ${includes[$package]} \
+    ${libs[$package]} \
+    ${sysdeps[$package]} \
+    ${configopts[$package]}
+  $MAKEBIN
+  $MAKEBIN DESTDIR="$PACKAGEDIR/${package}" install
+}
+
+function tar_skarnet_package {
+  local package
+  package="$1"
+
+  if [[ -d "$PACKAGEDIR/${package}/usr/bin" ]]; then
+    find "$PACKAGEDIR/${package}/usr/bin" -type f -exec strip {} \;
+  fi
+
+  tar -czf "$DISTDIR/${package}-${versions[$package]}-linux-amd64-bin.tar.gz" \
+    --owner 0 \
+    --group 0 \
+    --exclude 'usr/lib' \
+    --exclude 'usr/include' \
+    -C "$PACKAGEDIR/${package}" .
+}
+
+function install_skarnet_package {
+  local package
+  package="$1"
+  echo "==> Install ${package}@${versions[$package]}"
+
+  # extract to root for install
+  tar -xvzf "$DISTDIR/${package}-${versions[$package]}-linux-amd64-bin.tar.gz" \
+    -C '/'
+}
+
+function cleanup {
+  echo "==> Cleanup"
+  rm -rf "$BASEDIR"
+}
+
+build_make
+build_musl
+
+for package in "${skarnet_all_packages[@]}"; do
+  build_skarnet_package "$package"
+  tar_skarnet_package "$package"
+done
+
+for package in "${skarnet_install_packages[@]}"; do
+  install_skarnet_package "$package"
+done
+
+cleanup
